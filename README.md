@@ -14,15 +14,16 @@
 注意注意注意，chrome内核请仍然使用作者原版即codex-auth-helper；
 只是本人是firefox浏览器，所以适配了firefox的版本！
 firefox版本使用方法:
-  1) 下载externsion文件夹到本地
+  1) 下载extension文件夹到本地
   2) 打开firefox浏览器登录chatgpt网页端
   3) firefox浏览器新开网页输入: about:debugging#/runtime/this-firefox 回车
   4) 点"导入临时扩展" -> 选择解压的extension里的manifest.json -> 点reload
   5) 去登录好的chatgpt网页在右上角点扩展按钮(拼图形状) -> 点击里面的 Codex认证助手 -> 等待解析完成 -> 点击导出
   6) 将auth.json放到.codex（codex的安装配置目录，不知道在哪里的用everything搜下.codex）文件夹下
   7) 退出codex，重新启动codex即可
-     
-####################################################################################################
+
+####################################################################################################     
+
 ---
 
 ## 🌟 核心特性
