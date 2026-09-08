@@ -1,67 +1,140 @@
-// background.js — Service Worker 异步获取 Session 数据 + 文件下载
-// 符合 Manifest V3 最佳实践，避免全局状态丢失
+// background.js — Firefox / Chrome 双兼容
+// Firefox 临时加载扩展的 background script 有完整的 chrome.* API 兼容层
+// 直接用 chrome.* 是最稳的方式，不要再"探测 browser"了
+
+const IS_FIREFOX = (typeof browser !== "undefined" && browser.runtime && browser.runtime.getBrowserInfo);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'fetch_session') {
-    // 异步执行请求
     fetchChatGPTSession()
-      .then(sessionData => {
-        sendResponse({ success: true, data: sessionData });
-      })
+      .then(sessionData => sendResponse({ success: true, data: sessionData }))
       .catch(error => {
-        console.error('获取 ChatGPT Session 失败:', error);
-        sendResponse({ success: false, error: error.message });
+        const msg = (error && error.message) || String(error);
+        console.error('[CodexHelper] fetch_session 失败:', msg, error);
+        sendResponse({ success: false, error: msg });
       });
-    return true; // 重要：保持异步通信通道开启
+    return true; // 保持异步通道
   }
 
   if (message.action === 'download_auth_json') {
-    // 在 Service Worker 进程中执行下载，完全独立于 Popup 生命周期
-    const dataUrl = 'data:application/json;charset=utf-8,' + encodeURIComponent(message.jsonContent);
-    chrome.downloads.download({
-      url: dataUrl,
+    const jsonText = message.jsonContent;
+    // 关键：用 Blob + URL.createObjectURL 生成 blob URL，Chrome 和 Firefox 都接受
+    // - data: URL 在 Firefox 被 downloads.download 拒绝
+    // - body 字段是 POST 请求 body，不能替代 url
+    // - blob URL 是唯一通用解
+    const blob = new Blob([jsonText], { type: 'application/json' });
+    const blobUrl = URL.createObjectURL(blob);
+    const downloadOptions = {
+      url: blobUrl,
       filename: 'auth.json',
-      saveAs: false
-    }, (downloadId) => {
-      if (chrome.runtime.lastError) {
-        console.error('下载异常:', chrome.runtime.lastError);
-        sendResponse({ success: false, error: chrome.runtime.lastError.message });
-      } else {
-        sendResponse({ success: true, downloadId: downloadId });
-      }
-    });
-    return true; // 保持异步通信通道开启
+      saveAs: false,
+      conflictAction: 'overwrite'
+    };
+    const cleanup = (idOrErr) => {
+      // 释放 blob URL
+      try { URL.revokeObjectURL(blobUrl); } catch (e) { /* ignore */ }
+      return idOrErr;
+    };
+
+    if (IS_FIREFOX) {
+      browser.downloads.download(downloadOptions)
+        .then(id => { sendResponse({ success: true, downloadId: cleanup(id) }); })
+        .catch(err => {
+          console.error('[CodexHelper] 下载异常:', err);
+          cleanup(null);
+          sendResponse({ success: false, error: err.message || String(err) });
+        });
+    } else {
+      chrome.downloads.download(downloadOptions, (downloadId) => {
+        if (chrome.runtime.lastError) {
+          console.error('[CodexHelper] 下载异常:', chrome.runtime.lastError);
+          cleanup(null);
+          sendResponse({ success: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        sendResponse({ success: true, downloadId: cleanup(downloadId) });
+      });
+    }
+    return true;
+  }
+
+  if (message.action === 'open_tab' && message.url) {
+    chrome.tabs.create({ url: message.url, active: true });
+    sendResponse({ success: true });
+    return false; // 同步
   }
 });
 
-/**
- * 跨域请求 ChatGPT Session 接口
- * 由于在 manifest.json 中声明了 https://chatgpt.com/ 的 host_permissions，
- * Service Worker 可以在后台安全且不受跨域同源策略(CORS)限制地发起此请求。
- */
 async function fetchChatGPTSession() {
-  const response = await fetch('https://chatgpt.com/api/auth/session', {
-    method: 'GET',
-    headers: {
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache'
-    }
+  console.log('[CodexHelper] fetch_session 开始');
+
+  const target = await ensureChatGPTTab();
+  console.log('[CodexHelper] 目标 tab:', target.id, target.url, 'status:', target.status);
+
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId: target.id },
+      files: ['inject.js']
+    });
+  } catch (e) {
+    console.error('[CodexHelper] executeScript 抛错:', e);
+    throw new Error('executeScript 失败: ' + e.message);
+  }
+
+  console.log('[CodexHelper] executeScript 返回:', JSON.stringify(results).slice(0, 300));
+
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error('注入无结果（results 空数组）');
+  }
+  const ret = results[0];
+  if (!ret || typeof ret !== 'object') {
+    throw new Error('注入无结果（results[0] 不是对象）');
+  }
+  // executeScript 返回 [{frameId, result: <注入返回值>}]，真正的值在 .result
+  const inner = ret.result;
+  if (!inner || typeof inner !== 'object') {
+    throw new Error('注入 result 字段不是对象');
+  }
+  if (!inner.ok) {
+    throw new Error(inner.error || '注入返回失败');
+  }
+  return inner.data;
+}
+
+async function ensureChatGPTTab() {
+  const found = await chrome.tabs.query({ url: 'https://chatgpt.com/*' });
+  console.log('[CodexHelper] tabs.query 找到', found.length, '个 chatgpt.com 标签');
+  if (found && found.length > 0) {
+    const active = found.find(t => t.active) || found[0];
+    // 如果是 complete，直接用；否则等加载完
+    if (active.status === 'complete') return active;
+    await waitForTabComplete(active.id);
+    return active;
+  }
+
+  // 没有就后台开一个
+  console.log('[CodexHelper] 没有 chatgpt.com 标签，新建一个');
+  const created = await chrome.tabs.create({ url: 'https://chatgpt.com/', active: false });
+  await waitForTabComplete(created.id);
+  return created;
+}
+
+function waitForTabComplete(tabId) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+
+    chrome.tabs.get(tabId).then(tab => {
+      if (tab && tab.status === 'complete') return finish();
+      const listener = (updatedId, info) => {
+        if (updatedId === tabId && info.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          finish();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); finish(); }, 30000);
+    });
   });
-
-  if (response.status === 401 || response.status === 403) {
-    throw new Error('UNAUTHORIZED');
-  }
-
-  if (!response.ok) {
-    throw new Error(`HTTP 异常，状态码: ${response.status}`);
-  }
-
-  const data = await response.json();
-  
-  // 校验是否获取到了合法的 accessToken，若为空或未定义则判定为未登录
-  if (!data || !data.accessToken) {
-    throw new Error('UNAUTHORIZED');
-  }
-
-  return data;
 }
