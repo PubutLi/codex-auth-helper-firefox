@@ -1,68 +1,54 @@
-// popup.js — Codex 登陆助手核心交互逻辑
-// 遵循纯本地处理原则，不存储、不上云
+// popup.js — Firefox / Chrome 双兼容
+// 直接用 chrome.*（Firefox 临时加载扩展有完整兼容层）
 
-// 缓存全局 Session 数据
 let globalSession = null;
 let countdownInterval = null;
 
 document.addEventListener('DOMContentLoaded', () => {
-  // 初始化界面获取数据
   initSessionFetch();
-  
-  // 绑定基础事件监听
   bindEvents();
 });
 
-/**
- * 初始化 Session 获取
- */
-function initSessionFetch() {
+async function initSessionFetch() {
   showState('loading');
-  
-  // 向 background.js 发送请求，发起跨域 fetch
-  chrome.runtime.sendMessage({ action: 'fetch_session' }, (response) => {
-    // 拦截通道关闭或报错
-    if (chrome.runtime.lastError) {
-      console.error('通信错误:', chrome.runtime.lastError);
-      showState('unauthorized');
-      return;
-    }
-
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'fetch_session' });
     if (response && response.success) {
       globalSession = response.data;
       renderAuthorizedState(response.data);
       showState('authorized');
     } else {
-      showState('unauthorized');
+      showState('unauthorized', response && response.error);
     }
-  });
-}
-
-/**
- * 切换界面显示状态
- * @param {'loading'|'unauthorized'|'authorized'} state 
- */
-function showState(state) {
-  const loadingEl = document.getElementById('state-loading');
-  const unauthorizedEl = document.getElementById('state-unauthorized');
-  const authorizedEl = document.getElementById('state-authorized');
-
-  loadingEl.classList.remove('active');
-  unauthorizedEl.classList.remove('active');
-  authorizedEl.classList.remove('active');
-
-  if (state === 'loading') {
-    loadingEl.classList.add('active');
-  } else if (state === 'unauthorized') {
-    unauthorizedEl.classList.add('active');
-  } else if (state === 'authorized') {
-    authorizedEl.classList.add('active');
+  } catch (e) {
+    console.error('[CodexHelper] 通信错误:', e);
+    showState('unauthorized', e.message || String(e));
   }
 }
 
-/**
- * 渲染已登录状态的 UI 数据
- */
+function showState(state, errorMsg) {
+  const ids = ['state-loading', 'state-unauthorized', 'state-authorized'];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.classList.remove('active');
+  }
+  const map = { loading: 'state-loading', unauthorized: 'state-unauthorized', authorized: 'state-authorized' };
+  if (map[state]) document.getElementById(map[state]).classList.add('active');
+
+  if (state === 'unauthorized' && errorMsg) {
+    const desc = document.querySelector('#state-unauthorized .state-desc');
+    if (desc) {
+      desc.innerHTML = '错误信息：<code style="color:#ff6b6b;font-size:11px;">' +
+                       escapeHtml(errorMsg) + '</code>' +
+                       '<br><br>请先登录 ChatGPT 账号。';
+    }
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
 function renderAuthorizedState(session) {
   const avatarEl = document.getElementById('user-avatar');
   const nameEl = document.getElementById('user-name');
@@ -70,129 +56,106 @@ function renderAuthorizedState(session) {
   const planEl = document.getElementById('badge-plan');
   const expiresEl = document.getElementById('token-expires');
 
-  // 用户个人信息
   const user = session.user || {};
-  avatarEl.src = user.image || 'https://lh3.googleusercontent.com/a/default-user=s96-c';
-  nameEl.textContent = user.name || 'ChatGPT 用户';
-  emailEl.textContent = user.email || '未绑定邮箱';
+  if (avatarEl) avatarEl.src = user.image || 'https://lh3.googleusercontent.com/a/default-user=s96-c';
+  if (nameEl) nameEl.textContent = user.name || 'ChatGPT 用户';
+  if (emailEl) emailEl.textContent = user.email || '未绑定邮箱';
 
-  // 账户套餐
   const account = session.account || {};
   const planType = (account.planType || 'free').toUpperCase();
-  planEl.textContent = planType;
-  
-  if (planType === 'PLUS' || planType === 'PRO') {
-    planEl.className = 'plan-badge plus';
-  } else {
-    planEl.className = 'plan-badge free';
+  if (planEl) {
+    planEl.textContent = planType;
+    planEl.className = (planType === 'PLUS' || planType === 'PRO') ? 'plan-badge plus' : 'plan-badge free';
   }
 
-  // 有效期至
   const expiresTime = session.expires ? new Date(session.expires) : null;
-  if (expiresTime) {
+  if (expiresTime && expiresEl) {
     expiresEl.textContent = formatLocalDate(expiresTime);
-    // 启动剩余期限实时倒计时
     startCountdown(expiresTime);
-  } else {
+  } else if (expiresEl) {
     expiresEl.textContent = '长期有效';
-    document.getElementById('token-countdown').textContent = '无限';
+    const cd = document.getElementById('token-countdown');
+    if (cd) cd.textContent = '无限';
   }
 }
 
-/**
- * 绑定所有 DOM 按钮事件
- */
 function bindEvents() {
-  // 1. 未登录一键跳转
-  document.getElementById('btn-login').addEventListener('click', () => {
-    chrome.tabs.create({ url: 'https://chatgpt.com/' });
-    window.close(); // 关闭 popup 窗口
-  });
+  const btnLogin = document.getElementById('btn-login');
+  if (btnLogin) {
+    btnLogin.addEventListener('click', () => {
+      // 委托给 background 创建 tab（避免 popup 自身缺 tabs 权限问题）
+      chrome.runtime.sendMessage({ action: 'open_tab', url: 'https://chatgpt.com/' });
+      window.close();
+    });
+  }
 
-  // 2. 导出 auth.json — 委托给 background service worker 执行下载
-  document.getElementById('btn-download').addEventListener('click', () => {
-    if (!globalSession) return;
-    const authJsonString = generateCodexAuthJson(globalSession);
-    
-    chrome.runtime.sendMessage({
-      action: 'download_auth_json',
-      jsonContent: authJsonString
-    }, (response) => {
-      if (chrome.runtime.lastError) {
-        console.error('下载通信异常:', chrome.runtime.lastError);
-        showToast('❌ 下载失败，请重新尝试');
-        return;
-      }
-      if (response && response.success) {
+  const btnDownload = document.getElementById('btn-download');
+  if (btnDownload) {
+    btnDownload.addEventListener('click', async () => {
+      if (!globalSession) return;
+      const authJsonString = generateCodexAuthJson(globalSession);
+
+      // 用 anchor download 直接触发：blob URL 在 popup 的 document scope，
+      // 比走 background 的 downloads.download(blob URL) 稳——后者跨 scope 读 blob 会失败
+      try {
+        const blob = new Blob([authJsonString], { type: 'application/json' });
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = 'auth.json';
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // 延迟 revoke，等浏览器读完 blob
+        setTimeout(() => { try { URL.revokeObjectURL(blobUrl); } catch (e) {} }, 5000);
         showToast('🎉 auth.json 已开始下载');
-      } else {
-        showToast('❌ 下载失败，请重新尝试');
+      } catch (e) {
+        console.error('[CodexHelper] 下载异常:', e);
+        showToast('❌ 下载失败：' + (e.message || String(e)));
       }
     });
-  });
+  }
 }
 
-/**
- * 实时计算并更新剩余过期时间倒计时
- */
 function startCountdown(expiresTime) {
   if (countdownInterval) clearInterval(countdownInterval);
-
   const countdownEl = document.getElementById('token-countdown');
-
+  if (!countdownEl) return;
   function update() {
-    const now = new Date();
-    const diff = expiresTime - now;
-
+    const diff = expiresTime - new Date();
     if (diff <= 0) {
       countdownEl.textContent = '已过期';
       countdownEl.className = 'detail-value text-danger';
       clearInterval(countdownInterval);
       return;
     }
-
-    // 换算天、小时、分、秒
-    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-    const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-    const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
-    const seconds = Math.floor((diff % (1000 * 60)) / 1000);
-
-    let displayStr = '';
-    if (days > 0) displayStr += `${days}天`;
-    if (hours > 0 || days > 0) displayStr += `${hours}时`;
-    displayStr += `${minutes}分${seconds}秒`;
-
-    countdownEl.textContent = displayStr;
+    const days = Math.floor(diff / 86400000);
+    const hours = Math.floor((diff % 86400000) / 3600000);
+    const minutes = Math.floor((diff % 3600000) / 60000);
+    const seconds = Math.floor((diff % 60000) / 1000);
+    let s = '';
+    if (days > 0) s += `${days}天`;
+    if (hours > 0 || days > 0) s += `${hours}时`;
+    s += `${minutes}分${seconds}秒`;
+    countdownEl.textContent = s;
   }
-
   update();
   countdownInterval = setInterval(update, 1000);
 }
 
-/**
- * 格式化输出本地化的年月日 时分秒
- */
 function formatLocalDate(date) {
-  const pad = (num) => String(num).padStart(2, '0');
+  const pad = (n) => String(n).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-/**
- * 核心转换逻辑：将获取到的 ChatGPT Session 数据转化为符合 Codex 要求的格式
- * 
- * ⚠️ 已知限制：refresh_token 使用的是 ChatGPT 的 sessionToken，
- * 它不是真正的 OAuth2 refresh_token（真正的 refresh_token 只能通过 auth.openai.com
- * 的验证流程获取，而该流程需要手机验证——正是本插件想绕过的障碍）。
- * Codex 在尝试刷新 token 时可能会失败，届时需要重新导出 auth.json。
- */
 function generateCodexAuthJson(session) {
   const accountId = session.account?.id || '';
   const email = session.user?.email || '';
   const planType = session.account?.planType || 'free';
   const iat = Math.floor(Date.now() / 1000);
-  const exp = session.expires ? Math.floor(new Date(session.expires).getTime() / 1000) : iat + (30 * 24 * 3600);
+  const exp = session.expires ? Math.floor(new Date(session.expires).getTime() / 1000) : iat + 30 * 86400;
 
-  // 构建 Synthetic id_token (无签名 JWT)
   const jwtHeader = { alg: 'none', typ: 'JWT', cpa_synthetic: true };
   const jwtPayload = {
     iat, exp,
@@ -204,56 +167,28 @@ function generateCodexAuthJson(session) {
     },
     email
   };
+  const b64 = (o) => btoa(unescape(encodeURIComponent(JSON.stringify(o))))
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const idToken = `${b64(jwtHeader)}.${b64(jwtPayload)}.synthetic`;
 
-  const base64UrlEncode = (obj) => {
-    const str = JSON.stringify(obj);
-    const base64 = btoa(unescape(encodeURIComponent(str)));
-    return base64.replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  };
-
-  const syntheticIdToken = `${base64UrlEncode(jwtHeader)}.${base64UrlEncode(jwtPayload)}.synthetic`;
-
-  const authConfig = {
+  return JSON.stringify({
     auth_mode: "chatgpt",
     OPENAI_API_KEY: null,
     tokens: {
-      id_token: syntheticIdToken,
+      id_token: idToken,
       access_token: session.accessToken,
       refresh_token: session.sessionToken || "placeholder",
       account_id: accountId
     },
     last_refresh: new Date().toISOString()
-  };
-
-  return JSON.stringify(authConfig, null, 2);
+  }, null, 2);
 }
 
-/**
- * 一键复制公共方法
- */
-function copyToClipboard(text, successMsg) {
-  navigator.clipboard.writeText(text)
-    .then(() => {
-      showToast(successMsg);
-    })
-    .catch(err => {
-      console.error('复制失败:', err);
-      showToast('❌ 复制失败，请手动选取');
-    });
-}
-
-/**
- * 弹出精致轻巧的 Toast 反馈
- */
 function showToast(message) {
   const toast = document.getElementById('toast');
+  if (!toast) return;
   const toastMsg = document.getElementById('toast-message');
-  
-  toastMsg.textContent = message;
+  if (toastMsg) toastMsg.textContent = message;
   toast.classList.add('show');
-  
-  // 2秒后淡出
-  setTimeout(() => {
-    toast.classList.remove('show');
-  }, 2000);
+  setTimeout(() => toast.classList.remove('show'), 2000);
 }
